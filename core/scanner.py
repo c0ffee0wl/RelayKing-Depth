@@ -1,0 +1,551 @@
+"""
+RelayKing Scanner
+Main scanning orchestration and coordination
+"""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List
+import sys
+import socket
+
+try:
+    import dns.resolver
+    import dns.query
+    import dns.message
+    import dns.rdatatype
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+
+from .target_parser import TargetParser, _is_valid_unicast_ip
+from .relay_analyzer import RelayAnalyzer
+from .port_scanner import FastPortScanner
+from protocols.smb_detector import SMBDetector
+from protocols.http_detector import HTTPDetector, HTTPSDetector
+from protocols.ldap_detector import LDAPDetector, LDAPSDetector
+from protocols.mssql_detector import MSSQLDetector
+from protocols.rpc_detector import RPCDetector
+from protocols.additional_detectors import (
+    SMTPDetector, IMAPDetector, IMAPSDetector,
+    WINRMDetector, WINRMSDetector
+)
+from detectors.webdav_detector import WebDAVDetector
+from detectors.ntlm_reflection import NTLMReflectionDetector
+from detectors.ntlmv1_detector import NTLMv1Detector
+from detectors.coercion import CoercionDetector
+
+
+class RelayKingScanner:
+    """Main scanner class"""
+
+    # Default protocols to scan (HTTP/HTTPS only scanned on high-value targets)
+    DEFAULT_PROTOCOLS = ['smb', 'ldap', 'ldaps', 'mssql']
+
+    # High-value target indicators (SCCM/ADCS)
+    # Note: 'ca' is intentionally excluded - it matches too many hostnames (Exchange CAS, etc.)
+    # ADCS detection relies on LDAP pKIEnrollmentService queries or HTTP /certsrv/ detection
+    HIGH_VALUE_INDICATORS = ['sccm', 'mecm', 'configmgr', 'certsrv', 'pki']
+
+    # Protocol to detector mapping
+    PROTOCOL_DETECTORS = {
+        'smb': (SMBDetector, 445),
+        'http': (HTTPDetector, 80),
+        'https': (HTTPSDetector, 443),
+        'ldap': (LDAPDetector, 389),
+        'ldaps': (LDAPSDetector, 636),
+        'mssql': (MSSQLDetector, 1433),
+        'rpc': (RPCDetector, 135),
+        'smtp': (SMTPDetector, 25),
+        'imap': (IMAPDetector, 143),
+        'imaps': (IMAPSDetector, 993),
+        'winrm': (WINRMDetector, 5985),
+        'winrms': (WINRMSDetector, 5986),
+    }
+
+    def __init__(self, config):
+        self.config = config
+        self.target_parser = TargetParser(config)
+        # RelayAnalyzer is initialized later after target parsing to get tier-0 assets
+        self.relay_analyzer = None
+
+    def scan(self) -> Dict:
+        """
+        Run the scan
+
+        Returns:
+            dict with all results, analysis, and statistics
+        """
+        # Special mode: --coerce-all (only coerce, no protocol scanning)
+        if self.config.coerce_all:
+            return self._coerce_all_mode()
+
+        # Parse targets
+        print("[*] Parsing targets...")
+        targets = self.target_parser.parse_targets()
+
+        if not targets:
+            print("[!] No targets to scan")
+            return {
+                'targets': [],
+                'results': {},
+                'analysis': {},
+                'config': self._get_config_summary()
+            }
+
+        print(f"[+] Found {len(targets)} target(s)")
+
+        # Initialize RelayAnalyzer with tier-0 assets from target parsing
+        self.relay_analyzer = RelayAnalyzer(self.config, self.target_parser.tier0_assets)
+
+        # Determine which protocols to scan
+        protocols = self.config.protocols if self.config.protocols else self.DEFAULT_PROTOCOLS
+
+        # Ensure SMB is always scanned when not in null-auth mode (required for NTLM reflection detection)
+        if not self.config.null_auth and 'smb' not in protocols:
+            protocols = protocols.copy()  # Don't modify the original
+            protocols.insert(0, 'smb')  # Add SMB at the beginning
+
+        print(f"[*] Scanning protocols: {', '.join(protocols)}")
+        if self.config.protocols is None and not self.config.null_auth:
+            print(f"[*] Note: HTTP/HTTPS will be scanned on tier-0 assets only")
+        elif self.config.protocols is not None:
+            # User explicitly specified protocols - check if HTTP/HTTPS included
+            if 'http' in protocols or 'https' in protocols:
+                print(f"[!] WARNING: HTTP/HTTPS path enumeration enabled - scan will take significantly longer")
+                print(f"[*] Each HTTP/HTTPS host will be scanned against ~50 NTLM-enabled paths")
+        print(f"[*] Using {self.config.threads} threads")
+        print()
+
+        # Fast port scan if --proto-portscan enabled
+        port_scan_results = {}
+        if self.config.proto_portscan:
+            print("[*] Running fast port scan...")
+            port_scanner = FastPortScanner(timeout=0.1)  # 100ms timeout
+
+            # Determine which protocols to port scan
+            # Always include HTTP/HTTPS ports when tier-0 assets exist (for ADCS/SCCM detection)
+            protocols_for_portscan = protocols.copy()
+            if self.target_parser.tier0_assets:
+                # Add HTTP/HTTPS to port scan for tier-0 asset detection
+                if 'http' not in protocols_for_portscan:
+                    protocols_for_portscan.append('http')
+                if 'https' not in protocols_for_portscan:
+                    protocols_for_portscan.append('https')
+
+            # First pass: scan all targets for base protocols
+            port_scan_results = port_scanner.scan_hosts(targets, protocols_for_portscan, threads=50)
+
+            # Count open ports
+            total_open = sum(len(ports) for ports in port_scan_results.values())
+            hosts_with_open = sum(1 for ports in port_scan_results.values() if ports)
+            print(f"[+] Port scan complete: {total_open} open ports across {hosts_with_open} hosts")
+            print()
+
+        # Scan all targets
+        all_results = {}
+
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            # Submit all scan tasks
+            future_to_target = {}
+
+            for target in targets:
+                future = executor.submit(self._scan_target, target, protocols, port_scan_results)
+                future_to_target[future] = target
+
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
+
+                try:
+                    result = future.result()
+
+                    # Resolve target IP and add to results
+                    resolved_ips = self._resolve_target_ip(target)
+                    result['_target_ips'] = resolved_ips  # Store IPs with underscore prefix to mark as metadata
+
+                    all_results[target] = result
+
+                    # Print progress
+                    if self.config.verbose >= 1:
+                        # Check if any protocol was actually available
+                        has_available = any(
+                            hasattr(pr, 'available') and pr.available
+                            for pr in result.values()
+                            if not isinstance(pr, dict)
+                        )
+
+                        if has_available:
+                            # Only show status if we could actually connect
+                            relayable = any(
+                                pr.is_relayable() for pr in result.values()
+                                if hasattr(pr, 'is_relayable')
+                            )
+                            status = "RELAYABLE" if relayable else "PROTECTED"
+                            print(f"[{completed}/{len(targets)}] {target}: {status}")
+                        else:
+                            # Skip hosts where we couldn't connect to any protocol
+                            pass
+                    else:
+                        sys.stdout.write(f"\r[*] Progress: {completed}/{len(targets)}")
+                        sys.stdout.flush()
+
+                except Exception as e:
+                    if self.config.verbose >= 1:
+                        print(f"[!] Error scanning {target}: {e}")
+
+        if self.config.verbose == 0:
+            print()  # Newline after progress
+
+        # Check for NTLMv1 support first (before analysis)
+        ntlmv1_analysis = None
+        if self.config.check_ntlmv1 or self.config.check_ntlmv1_all:
+            print("\n[*] Checking for NTLMv1 support...")
+            ntlmv1_analysis = self._check_ntlmv1(targets, all_results)
+
+        # Run analysis
+        print("[*] Analyzing results...")
+        analysis = self.relay_analyzer.analyze(all_results, ntlmv1_analysis)
+
+        if self.config.check_coercion:
+            print("[*] Checking for coercion vulnerabilities...")
+            analysis['coercion'] = self._check_coercion(targets)
+
+        # Compile final results
+        final_results = {
+            'targets': targets,
+            'results': all_results,
+            'analysis': analysis,
+            'config': self._get_config_summary()
+        }
+
+        return final_results
+
+    def _coerce_all_mode(self) -> Dict:
+        """
+        Special mode: --coerce-all
+        Enumerate AD computers and coerce them all to authenticate to listener
+        """
+        print("[*] Coerce-All Mode: Enumerating computers from Active Directory...")
+
+        # Use target parser to enumerate AD (it already has this logic)
+        targets = self.target_parser.parse_targets()
+
+        if not targets:
+            print("[!] No targets found in Active Directory")
+            return {
+                'targets': [],
+                'coercion_count': 0,
+                'listener': self.config.coerce_target,
+                'config': self._get_config_summary()
+            }
+
+        print(f"[+] Found {len(targets)} target(s)")
+        print(f"[*] Initiating coercion attacks to {self.config.coerce_target}...")
+
+        # Import coercion detector
+        from detectors.coercion import CoercionDetector
+        coercion_detector = CoercionDetector(self.config)
+
+        # Run coercion on all targets
+        completed = 0
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            future_to_target = {}
+
+            for target in targets:
+                future = executor.submit(coercion_detector.detect, target)
+                future_to_target[future] = target
+
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
+
+                try:
+                    result = future.result()
+
+                    # Show progress
+                    if self.config.verbose >= 1:
+                        print(f"[{completed}/{len(targets)}] Coerced: {target}")
+                    else:
+                        sys.stdout.write(f"\r[*] Coercion progress: {completed}/{len(targets)}")
+                        sys.stdout.flush()
+
+                except Exception as e:
+                    if self.config.verbose >= 2:
+                        print(f"[!] Error coercing {target}: {e}")
+
+            if self.config.verbose == 0:
+                print()  # Newline after progress
+
+        # Final summary
+        print(f"\n[+] Coercion complete. All {len(targets)} targets should have initiated computer account connections to {self.config.coerce_target}")
+
+        return {
+            'targets': targets,
+            'coercion_count': len(targets),
+            'listener': self.config.coerce_target,
+            'config': self._get_config_summary()
+        }
+
+    def _scan_target(self, target: str, protocols: List[str], port_scan_results: Dict = None) -> Dict:
+        """Scan a single target for all specified protocols"""
+
+        results = {}
+
+        # Check if this is a tier-0 asset
+        # In audit mode with credentials, use LDAP-detected tier-0 assets
+        # Otherwise fall back to hostname-based detection
+        target_lower = target.lower()
+        if self.config.audit_mode and not self.config.null_auth and self.target_parser.tier0_assets:
+            # Use LDAP-detected tier-0 assets
+            # Check both exact match and short hostname match (in case of FQDN vs hostname mismatch)
+            is_high_value = target_lower in self.target_parser.tier0_assets
+            if not is_high_value:
+                # Also check if any tier0 asset's FQDN matches (handle FQDN vs short hostname)
+                target_short = target_lower.split('.')[0]
+                for asset in self.target_parser.tier0_assets:
+                    asset_short = asset.split('.')[0]
+                    if target_short == asset_short or target_lower == asset or asset == target_short:
+                        is_high_value = True
+                        break
+        else:
+            # Fall back to hostname-based detection
+            is_high_value = any(indicator in target_lower for indicator in self.HIGH_VALUE_INDICATORS)
+
+        # Determine protocols to scan for this target
+        protocols_to_scan = protocols.copy()
+
+        # Always scan HTTP/HTTPS on high-value/tier-0 targets, even if not in protocol list
+        # This ensures we detect ADCS/SCCM relay paths on critical infrastructure
+        if is_high_value:
+            if 'http' not in protocols_to_scan:
+                protocols_to_scan.append('http')
+            if 'https' not in protocols_to_scan:
+                protocols_to_scan.append('https')
+
+        # Filter protocols based on port scan results if --proto-portscan enabled
+        if port_scan_results is not None and target in port_scan_results:
+            open_ports = port_scan_results[target]
+            protocols_to_scan = [
+                proto for proto in protocols_to_scan
+                if proto in self.PROTOCOL_DETECTORS and self.PROTOCOL_DETECTORS[proto][1] in open_ports
+            ]
+
+        # Scan each protocol
+        for protocol in protocols_to_scan:
+            if protocol not in self.PROTOCOL_DETECTORS:
+                continue
+
+            detector_class, default_port = self.PROTOCOL_DETECTORS[protocol]
+
+            try:
+                detector = detector_class(self.config)
+                result = detector.detect(target)
+                results[protocol] = result
+
+            except Exception as e:
+                if self.config.verbose >= 2:
+                    print(f"[!] Error detecting {protocol} on {target}: {e}")
+
+        # Additional detections on this target (skip in null auth mode)
+        if not self.config.null_auth:
+            # WebDAV detection (requires SMB and credentials to access IPC$ pipe)
+            if 'smb' in results and results['smb'].available:
+                try:
+                    webdav_detector = WebDAVDetector(self.config)
+                    webdav_result = webdav_detector.detect(target)
+                    results['webdav'] = webdav_result
+                except Exception as e:
+                    if self.config.verbose >= 2:
+                        print(f"[!] Error detecting WebDAV on {target}: {e}")
+
+            # NTLM reflection analysis (requires credentials to read registry)
+            try:
+                reflection_detector = NTLMReflectionDetector(self.config)
+                reflection_result = reflection_detector.analyze(results, target)
+                results['ntlm_reflection'] = reflection_result
+            except Exception as e:
+                if self.config.verbose >= 2:
+                    print(f"[!] Error analyzing NTLM reflection on {target}: {e}")
+
+        return results
+
+    def _check_coercion(self, targets: List[str]) -> Dict:
+        """Check coercion vulnerabilities across all targets"""
+
+        coercion_results = {}
+        coercion_detector = CoercionDetector(self.config)
+
+        with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+            future_to_target = {}
+
+            for target in targets:
+                future = executor.submit(coercion_detector.detect, target)
+                future_to_target[future] = target
+
+            completed = 0
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
+
+                try:
+                    result = future.result()
+                    coercion_results[target] = result
+
+                    # Show progress if verbose
+                    if self.config.verbose >= 1:
+                        print(f"[{completed}/{len(targets)}] Coercion check: {target}")
+                    else:
+                        sys.stdout.write(f"\r[*] Coercion progress: {completed}/{len(targets)}")
+                        sys.stdout.flush()
+
+                except Exception as e:
+                    if self.config.verbose >= 2:
+                        print(f"[!] Error checking coercion on {target}: {e}")
+
+            if self.config.verbose == 0:
+                print()  # Newline after progress
+
+        return coercion_results
+
+    def _check_ntlmv1(self, targets: List[str], all_results: Dict) -> Dict:
+        """Check NTLMv1 support via GPO and/or registry"""
+
+        ntlmv1_results = {
+            'domain_policy': None,
+            'vulnerable_hosts': {}
+        }
+
+        detector = NTLMv1Detector(self.config)
+
+        # Check domain-wide GPO if --ntlmv1
+        if self.config.check_ntlmv1:
+            # Find a DC from the results (look for hosts with LDAP available)
+            dc_host = self._find_dc(all_results)
+            if dc_host:
+                if self.config.verbose >= 2:
+                    print(f"[*] Checking domain GPO for NTLMv1 policy on {dc_host}...")
+                ntlmv1_results['domain_policy'] = detector.check_gpo(dc_host)
+            else:
+                if self.config.verbose >= 1:
+                    print("[!] Could not find DC to check GPO for NTLMv1 policy")
+
+        # Check per-host registry if --ntlmv1-all
+        if self.config.check_ntlmv1_all:
+            if self.config.verbose >= 2:
+                print(f"[*] Checking {len(targets)} hosts for NTLMv1 support via registry...")
+
+            with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+                future_to_target = {
+                    executor.submit(detector.check_host_registry, target): target
+                    for target in targets
+                }
+
+                for future in as_completed(future_to_target):
+                    target = future_to_target[future]
+                    try:
+                        result = future.result()
+                        if result.get('enabled'):
+                            ntlmv1_results['vulnerable_hosts'][target] = result
+                    except Exception as e:
+                        if self.config.verbose >= 2:
+                            print(f"[!] Error checking NTLMv1 on {target}: {e}")
+
+        return ntlmv1_results
+
+    def _find_dc(self, all_results: Dict) -> str:
+        """Find a DC from scan results (look for hosts with LDAP available)"""
+        # Prefer hosts with both LDAP and SMB available
+        for target, results in all_results.items():
+            if 'ldap' in results and results['ldap'].available:
+                return target
+            if 'ldaps' in results and results['ldaps'].available:
+                return target
+
+        # Fallback: use dc_ip if specified
+        if self.config.dc_ip:
+            return self.config.dc_ip
+
+        return None
+
+    def _resolve_target_ip(self, target: str) -> List[str]:
+        """
+        Resolve target hostname to IP address(es)
+
+        Uses custom DNS server (-ns) and TCP (--dns-tcp) if specified,
+        otherwise falls back to system DNS.
+
+        Returns:
+            List of IP addresses (empty list if resolution fails)
+        """
+        # First check if target is already an IP
+        try:
+            socket.inet_aton(target)
+            return [target]  # Target is already an IP
+        except socket.error:
+            pass  # Not an IP, continue to resolve
+
+        # Use custom DNS if available and specified
+        if DNS_AVAILABLE and self.config.nameserver:
+            try:
+                nameserver = self.config.nameserver
+
+                # Resolve nameserver hostname to IP if needed
+                try:
+                    socket.inet_aton(nameserver)
+                except socket.error:
+                    # Nameserver is a hostname, resolve it first
+                    ns_info = socket.getaddrinfo(nameserver, None, socket.AF_INET)
+                    if ns_info:
+                        nameserver = ns_info[0][4][0]
+
+                # Create DNS query
+                query = dns.message.make_query(target, dns.rdatatype.A)
+
+                # Send query via TCP or UDP based on config
+                if self.config.dns_tcp:
+                    response = dns.query.tcp(query, nameserver, timeout=self.config.timeout)
+                else:
+                    response = dns.query.udp(query, nameserver, timeout=self.config.timeout)
+
+                # Extract IPs from response (filter out invalid addresses)
+                ips = []
+                for rrset in response.answer:
+                    for rdata in rrset:
+                        if hasattr(rdata, 'address'):
+                            ip = rdata.address
+                            if _is_valid_unicast_ip(ip):
+                                ips.append(ip)
+
+                if ips:
+                    return list(set(ips))
+
+            except Exception as e:
+                if self.config.verbose >= 3:
+                    print(f"[!] Custom DNS resolution failed for {target}: {e}")
+                # Fall through to system DNS
+
+        # Fallback to system DNS
+        try:
+            addr_info = socket.getaddrinfo(target, None, socket.AF_INET)
+            # Filter out invalid IPs (multicast, loopback, etc.)
+            ips = [addr[4][0] for addr in addr_info if _is_valid_unicast_ip(addr[4][0])]
+            return list(set(ips))
+        except (socket.gaierror, socket.timeout):
+            return []
+        except Exception:
+            return []
+
+    def _get_config_summary(self) -> Dict:
+        """Get summary of scan configuration"""
+        return {
+            'username': self.config.username,
+            'domain': self.config.domain,
+            'null_auth': self.config.null_auth,
+            'protocols': self.config.protocols,
+            'check_ntlmv1': self.config.check_ntlmv1,
+            'check_coercion': self.config.check_coercion,
+            'threads': self.config.threads,
+            'timeout': self.config.timeout,
+        }

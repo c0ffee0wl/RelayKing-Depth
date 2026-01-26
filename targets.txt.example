@@ -1,0 +1,18 @@
+# Example targets file for RelayKing
+# One target per line
+# Supports: IP addresses, hostnames, CIDR notation, IP ranges
+
+# Individual hosts
+192.168.1.10
+dc01.example.local
+fileserver.example.local
+
+# CIDR ranges
+10.0.0.0/24
+192.168.1.0/24
+
+# IP ranges
+172.16.1.1-254
+
+# Comments start with #
+# Empty lines are ignored
