@@ -185,6 +185,7 @@ python3 relayking.py -u ‘lowpriv’ -p ‘lowpriv-password’ -d client.domain
 * PRs should be thoroughly tested, ideally in multiple environments before being submitted. We'll test PRs before merging them, but the more testing in unique environments (especially after major changes/refactoring) = the better. I want to keep RelayKing reliable, robust, and high-performance - which mandates extensive testing.
 ## Credits
 
+- **My Team - Depth Security (https://www.depthsecurity.com/)**: Support, assistance, guidance, and testing. This tool would be useless without the team of teal.
 - **Nick Powers (SpecterOps) (https://github.com/zyn3rgy) - RelayInformer**: Inspiration and detection logic reference
 - **Numerous devs / Alex Neff (https://github.com/NeffIsBack) - NetExec**: Various detection logic implementations.
 - **Fortra/SecureAuthCorp/Numerous devs - Impacket**: Protocol implementations. Various other stuff.
