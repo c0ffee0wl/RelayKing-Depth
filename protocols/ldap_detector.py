@@ -154,7 +154,7 @@ class LDAPDetector(BaseDetector):
             # Try to bind to regular LDAP (non-SSL) without signing
             ldap_url = f"ldap://{host}"
             # Create connection - by default impacket doesn't enforce signing
-            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=host)
+            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=host, signing=False)
 
             # Attempt login with just domain (no credentials)
             # We just want to see if strongerAuthRequired error occurs
