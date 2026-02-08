@@ -17,7 +17,7 @@ setup(
     description="NTLM & Kerberos Relay Detection and Enumeration Tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/relayking",
+    url="",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",

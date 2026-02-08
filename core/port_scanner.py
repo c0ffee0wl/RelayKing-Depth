@@ -29,21 +29,21 @@ class FastPortScanner:
         'winrms': 5986,
     }
 
-    def __init__(self, timeout: float = 0.1):
+    def __init__(self, timeout: float = 0.5):
         """
         Initialize scanner
 
         Args:
-            timeout: Socket timeout in seconds (default 0.1 = 100ms)
+            timeout: Socket timeout in seconds (default 0.5 = 500ms)
         """
         self.timeout = timeout
 
-    def scan_host(self, host: str, ports: List[int]) -> Set[int]:
+    def scan_host(self, ip: str, ports: List[int]) -> Set[int]:
         """
-        Fast scan multiple ports on a single host
+        Fast scan multiple ports on a single host by IP
 
         Args:
-            host: Target hostname or IP
+            ip: Target IP address
             ports: List of ports to scan
 
         Returns:
@@ -52,12 +52,13 @@ class FastPortScanner:
         open_ports = set()
 
         for port in ports:
-            if self._check_port(host, port):
+            if self._check_port(ip, port):
                 open_ports.add(port)
 
         return open_ports
 
-    def scan_hosts(self, targets: List[str], protocols: List[str], threads: int = 50) -> Dict[str, Set[int]]:
+    def scan_hosts(self, targets: List[str], protocols: List[str],
+                   threads: int = 50, hostname_ip_map: Dict[str, str] = None) -> Dict[str, Set[int]]:
         """
         Fast scan multiple hosts for protocol ports
 
@@ -65,10 +66,14 @@ class FastPortScanner:
             targets: List of target hostnames/IPs
             protocols: List of protocols to check
             threads: Number of concurrent scans (default 50)
+            hostname_ip_map: Optional dict mapping hostnames to resolved IPs
 
         Returns:
-            Dict of {host: set(open_ports)}
+            Dict of {host: set(open_ports)} keyed by original hostname
         """
+        if hostname_ip_map is None:
+            hostname_ip_map = {}
+
         # Get unique ports for the specified protocols
         ports_to_scan = set()
         for protocol in protocols:
@@ -88,10 +93,12 @@ class FastPortScanner:
         last_update = 0
 
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            future_to_host = {
-                executor.submit(self.scan_host, host, ports_list): host
-                for host in targets
-            }
+            future_to_host = {}
+            for host in targets:
+                # Use resolved IP if available, otherwise fall back to hostname
+                scan_ip = hostname_ip_map.get(host, host)
+                future = executor.submit(self.scan_host, scan_ip, ports_list)
+                future_to_host[future] = host
 
             for future in as_completed(future_to_host):
                 host = future_to_host[future]
@@ -118,25 +125,31 @@ class FastPortScanner:
 
         return results
 
-    def _check_port(self, host: str, port: int) -> bool:
+    def _check_port(self, ip: str, port: int) -> bool:
         """
         Check if a single port is open
 
         Args:
-            host: Target hostname or IP
+            ip: Target IP address
             port: Port number
 
         Returns:
             True if port is open, False otherwise
         """
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
-            result = sock.connect_ex((host, port))
-            sock.close()
+            result = sock.connect_ex((ip, port))
             return result == 0
         except Exception:
             return False
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def get_port_for_protocol(self, protocol: str) -> int:
         """Get the port number for a given protocol"""

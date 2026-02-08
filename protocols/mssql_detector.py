@@ -13,13 +13,14 @@ from .base_detector import BaseDetector, ProtocolResult
 class MSSQLDetector(BaseDetector):
     """Detector for MSSQL protocol"""
 
-    def detect(self, host: str, port: int = 1433) -> ProtocolResult:
+    def detect(self, host: str, port: int = 1433, target_ip: str = None) -> ProtocolResult:
         """Detect MSSQL configuration"""
 
+        self._current_target_ip = self._resolve_ip(host, target_ip)
         result = self._create_result('mssql', host, port)
 
         # First check if MSSQL is even listening
-        if not self._is_port_open(host, port):
+        if not self._is_port_open(host, port, target_ip=target_ip):
             result.error = 'Port closed'
             return result
 
@@ -28,11 +29,11 @@ class MSSQLDetector(BaseDetector):
         # Test EPA by attempting connections with bogus/missing channel binding
         epa_result = self._test_epa(host, port)
 
-        if epa_result == 'NOT_ENFORCED':
+        if epa_result.startswith('NOT_ENFORCED'):
             result.epa_enforced = False
             if self._is_verbose(1):
                 result.additional_info['epa_status'] = 'EPA not enforced - RELAYABLE'
-        elif epa_result == 'ENFORCED':
+        elif epa_result.startswith('ENFORCED'):
             result.epa_enforced = True
             if self._is_verbose(1):
                 result.additional_info['epa_status'] = 'EPA enforced'
@@ -47,15 +48,18 @@ class MSSQLDetector(BaseDetector):
 
         return result
 
-    def _is_port_open(self, host: str, port: int) -> bool:
-        """Check if port is open"""
+    def _is_port_open(self, host: str, port: int, target_ip: str = None) -> bool:
+        """Check if port is open using resolved IP"""
+        connect_to = getattr(self, '_current_target_ip', host)
+        if target_ip:
+            connect_to = target_ip
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(3)  # Use 3-second timeout for quick port check
-            result = sock.connect_ex((host, port))
+            result = sock.connect_ex((connect_to, port))
             sock.close()
             return result == 0
-        except:
+        except Exception:
             return False
 
     def _test_epa(self, host: str, port: int) -> str:
@@ -77,8 +81,9 @@ class MSSQLDetector(BaseDetector):
         domain = self.config.domain or ''
 
         # Test 1: Try with bogus channel binding (should fail if EPA enforced)
+        connect_to = getattr(self, '_current_target_ip', host)
         try:
-            ms_sql = MSSQL(host, port)
+            ms_sql = MSSQL(connect_to, port)
             ms_sql.connect()
 
             # Attempt login - if EPA is enforced, this should fail

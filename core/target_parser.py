@@ -9,9 +9,6 @@ import subprocess
 import platform
 from typing import List, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from impacket.dcerpc.v5 import transport, samr
-from impacket.ldap import ldap, ldapasn1
-from impacket.smbconnection import SMBConnection
 import socket
 
 
@@ -63,6 +60,7 @@ class TargetParser:
         self.config = config
         self.targets: Set[str] = set()
         self.tier0_assets: Set[str] = set()  # Store tier-0 asset hostnames
+        self.hostname_ip_map: dict = {}  # hostname -> resolved IP mapping
 
     def parse_targets(self) -> List[str]:
         """Parse all target sources and return unique list"""
@@ -78,6 +76,15 @@ class TargetParser:
         # Enumerate from AD (in audit mode or coerce-all mode)
         if self.config.audit_mode or self.config.coerce_all:
             self._enumerate_ad()
+
+        # For targets that are already IPs, add identity mapping
+        for target in self.targets:
+            if target not in self.hostname_ip_map:
+                try:
+                    socket.inet_aton(target)
+                    self.hostname_ip_map[target] = target  # IP maps to itself
+                except socket.error:
+                    pass  # Hostname without resolution - will be skipped or resolved later
 
         return sorted(list(self.targets))
 
@@ -196,7 +203,7 @@ class TargetParser:
                 if self.config.use_kerberos:
                     # Use impacket for Kerberos LDAP authentication
                     from impacket.ldap import ldap as ldap_impacket
-                    from ldap3 import Server, Connection, NTLM, ALL, SUBTREE, SASL, KERBEROS
+                    from ldap3 import Server, Connection, NTLM, ALL, SUBTREE
                     import os
 
                     # Check for ccache in KRB5CCNAME environment variable
@@ -372,7 +379,11 @@ class TargetParser:
                         print(f"[*] Retrieved {page_count} computers in this page (total: {total_retrieved})")
 
                         # Get the cookie for the next page
-                        cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                        try:
+                            cookie = conn.result['controls']['1.2.840.113556.1.4.319']['value']['cookie']
+                        except KeyError:
+                            # Server didn't return paging controls - stop paging
+                            break
 
                         # If cookie is empty, we've retrieved all results
                         if not cookie:
@@ -504,14 +515,17 @@ class TargetParser:
             """Ping a single host"""
             try:
                 # Use subprocess with timeout
+                # -W (Linux) is in seconds, -w (Windows) is in milliseconds
+                timeout_flag = '-W' if platform.system().lower() != 'windows' else '-w'
+                timeout_value = '1' if platform.system().lower() != 'windows' else '1000'
                 result = subprocess.run(
-                    ['ping', param, '1', '-W' if platform.system().lower() != 'windows' else '-w', '1', ip],
+                    ['ping', param, '1', timeout_flag, timeout_value, ip],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=2
                 )
                 return ip if result.returncode == 0 else None
-            except:
+            except Exception:
                 return None
 
         # Multi-threaded ping sweep
@@ -525,8 +539,7 @@ class TargetParser:
         return live_hosts
 
     def _check_dns_resolution(self, hostnames: List[str]) -> List[str]:
-        """Check which hostnames resolve in DNS"""
-        from concurrent.futures import wait, ALL_COMPLETED
+        """Check which hostnames resolve in DNS and store hostname->IP mapping"""
         import time
 
         resolved = []
@@ -539,7 +552,7 @@ class TargetParser:
             print(f"[*] Using TCP for DNS resolution")
 
         def resolve_host(hostname):
-            """Try to resolve a single hostname with timeout"""
+            """Try to resolve a single hostname with timeout, returns (hostname, ip) or None"""
             try:
                 if custom_ns or use_tcp:
                     # Use dnspython for custom DNS server or TCP mode
@@ -570,14 +583,14 @@ class TargetParser:
                                     for rdata in rrset:
                                         ip = str(rdata)
                                         if _is_valid_unicast_ip(ip):
-                                            return hostname
+                                            return (hostname, ip)
                             return None
                         else:
                             # Standard UDP resolution
                             answers = resolver.resolve(hostname, 'A')
                             ip = str(answers[0])
                             if _is_valid_unicast_ip(ip):
-                                return hostname
+                                return (hostname, ip)
                             return None
                     except ImportError:
                         # dnspython not installed - only warn once (handled outside)
@@ -585,17 +598,21 @@ class TargetParser:
                     except Exception:
                         return None
 
-                # Use system DNS resolver
-                old_timeout = socket.getdefaulttimeout()
-                socket.setdefaulttimeout(3)  # 3 second DNS timeout per host
+                # Use system DNS resolver with per-call timeout
+                # Note: socket.getaddrinfo doesn't support a timeout parameter,
+                # so we use socket.create_connection as a proxy to test reachability,
+                # or just use getaddrinfo which respects the system resolver timeout.
+                # Avoid modifying global socket.setdefaulttimeout() as it causes
+                # race conditions in multi-threaded code.
                 try:
-                    ip = socket.gethostbyname(hostname)
-                    # Filter out invalid IPs (multicast, loopback, etc.)
-                    if _is_valid_unicast_ip(ip):
-                        return hostname
+                    addr_info = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+                    if addr_info:
+                        ip = addr_info[0][4][0]
+                        if _is_valid_unicast_ip(ip):
+                            return (hostname, ip)
                     return None
-                finally:
-                    socket.setdefaulttimeout(old_timeout)
+                except (socket.gaierror, socket.timeout, OSError):
+                    return None
             except (socket.gaierror, socket.timeout):
                 return None
             except ImportError:
@@ -621,7 +638,9 @@ class TargetParser:
                 try:
                     result = future.result(timeout=0.1)
                     if result:
-                        resolved.append(result)
+                        hostname, ip = result
+                        resolved.append(hostname)
+                        self.hostname_ip_map[hostname] = ip
                 except Exception:
                     pass
 

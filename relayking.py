@@ -89,17 +89,14 @@ def generate_relay_list(results):
     return sorted(relay_targets)
 
 
-def main():
-    """Main function"""
+def _run() -> int:
+    """Run the scanner and return an exit code"""
 
     # Print banner
     print_banner()
 
     # Parse arguments
-    try:
-        config = parse_arguments()
-    except SystemExit:
-        return 1
+    config = parse_arguments()
 
     # Create and run scanner
     try:
@@ -171,7 +168,7 @@ def main():
                 print(f"\n[*] No relayable targets found for relay list")
 
         return 0
-        
+
     except KeyboardInterrupt:
         print("\n[!] Scan interrupted by user")
         return 130
@@ -182,5 +179,11 @@ def main():
             traceback.print_exc()
         return 1
 
+
+def main():
+    """Entry point for both direct execution and console_scripts"""
+    sys.exit(_run())
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

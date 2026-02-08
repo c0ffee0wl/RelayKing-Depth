@@ -118,9 +118,12 @@ class RelayKingScanner:
 
         # Fast port scan if --proto-portscan enabled
         port_scan_results = {}
+        hostname_ip_map = self.target_parser.hostname_ip_map
         if self.config.proto_portscan:
             print("[*] Running fast port scan...")
-            port_scanner = FastPortScanner(timeout=0.1)  # 100ms timeout
+            # Use 1/10th of config timeout for port scan (min 0.5s), since it's just a quick check
+            portscan_timeout = max(0.5, self.config.timeout / 10.0)
+            port_scanner = FastPortScanner(timeout=portscan_timeout)
 
             # Determine which protocols to port scan
             # Always include HTTP/HTTPS ports when tier-0 assets exist (for ADCS/SCCM detection)
@@ -132,8 +135,11 @@ class RelayKingScanner:
                 if 'https' not in protocols_for_portscan:
                     protocols_for_portscan.append('https')
 
-            # First pass: scan all targets for base protocols
-            port_scan_results = port_scanner.scan_hosts(targets, protocols_for_portscan, threads=50)
+            # First pass: scan all targets for base protocols (use resolved IPs)
+            port_scan_results = port_scanner.scan_hosts(
+                targets, protocols_for_portscan, threads=50,
+                hostname_ip_map=hostname_ip_map
+            )
 
             # Count open ports
             total_open = sum(len(ports) for ports in port_scan_results.values())
@@ -149,7 +155,8 @@ class RelayKingScanner:
             future_to_target = {}
 
             for target in targets:
-                future = executor.submit(self._scan_target, target, protocols, port_scan_results)
+                target_ip = hostname_ip_map.get(target, target)
+                future = executor.submit(self._scan_target, target, protocols, port_scan_results, target_ip)
                 future_to_target[future] = target
 
             # Process results as they complete
@@ -161,8 +168,13 @@ class RelayKingScanner:
                 try:
                     result = future.result()
 
-                    # Resolve target IP and add to results
-                    resolved_ips = self._resolve_target_ip(target)
+                    # Use already-resolved IP from hostname_ip_map instead of re-resolving DNS
+                    # This avoids redundant DNS lookups and ensures consistency with the IP used for scanning
+                    mapped_ip = hostname_ip_map.get(target)
+                    if mapped_ip and mapped_ip != target:
+                        resolved_ips = [mapped_ip]
+                    else:
+                        resolved_ips = [target]
                     result['_target_ips'] = resolved_ips  # Store IPs with underscore prefix to mark as metadata
 
                     all_results[target] = result
@@ -202,7 +214,7 @@ class RelayKingScanner:
         ntlmv1_analysis = None
         if self.config.check_ntlmv1 or self.config.check_ntlmv1_all:
             print("\n[*] Checking for NTLMv1 support...")
-            ntlmv1_analysis = self._check_ntlmv1(targets, all_results)
+            ntlmv1_analysis = self._check_ntlmv1(targets, all_results, hostname_ip_map)
 
         # Run analysis
         print("[*] Analyzing results...")
@@ -236,6 +248,20 @@ class RelayKingScanner:
             print("[!] No targets found in Active Directory")
             return {
                 'targets': [],
+                'results': {},
+                'analysis': {
+                    'relay_paths': [],
+                    'high_value_targets': {'sccm': [], 'adcs': []},
+                    'statistics': {
+                        'total_hosts': 0,
+                        'relayable_hosts': 0,
+                        'critical_paths': 0,
+                        'high_paths': 0,
+                        'medium_paths': 0,
+                        'low_paths': 0,
+                    },
+                    'coercion': {},
+                },
                 'coercion_count': 0,
                 'listener': self.config.coerce_target,
                 'config': self._get_config_summary()
@@ -248,13 +274,15 @@ class RelayKingScanner:
         from detectors.coercion import CoercionDetector
         coercion_detector = CoercionDetector(self.config)
 
-        # Run coercion on all targets
+        # Run coercion on all targets (use resolved IPs)
+        hostname_ip_map = self.target_parser.hostname_ip_map
         completed = 0
         with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
             future_to_target = {}
 
             for target in targets:
-                future = executor.submit(coercion_detector.detect, target)
+                target_ip = hostname_ip_map.get(target, target)
+                future = executor.submit(coercion_detector.detect, target, target_ip=target_ip)
                 future_to_target[future] = target
 
             for future in as_completed(future_to_target):
@@ -283,13 +311,37 @@ class RelayKingScanner:
 
         return {
             'targets': targets,
+            'results': {},
+            'analysis': {
+                'relay_paths': [],
+                'high_value_targets': {'sccm': [], 'adcs': []},
+                'statistics': {
+                    'total_hosts': len(targets),
+                    'relayable_hosts': 0,
+                    'critical_paths': 0,
+                    'high_paths': 0,
+                    'medium_paths': 0,
+                    'low_paths': 0,
+                },
+                'coercion': {},
+            },
             'coercion_count': len(targets),
             'listener': self.config.coerce_target,
             'config': self._get_config_summary()
         }
 
-    def _scan_target(self, target: str, protocols: List[str], port_scan_results: Dict = None) -> Dict:
-        """Scan a single target for all specified protocols"""
+    def _scan_target(self, target: str, protocols: List[str], port_scan_results: Dict = None, target_ip: str = None) -> Dict:
+        """Scan a single target for all specified protocols
+
+        Args:
+            target: hostname or IP (used for display, Kerberos SPN, SMB name)
+            protocols: list of protocols to scan
+            port_scan_results: optional port scan results dict
+            target_ip: resolved IP address for TCP connections (falls back to target if None)
+        """
+
+        if target_ip is None:
+            target_ip = target
 
         results = {}
 
@@ -341,7 +393,7 @@ class RelayKingScanner:
 
             try:
                 detector = detector_class(self.config)
-                result = detector.detect(target)
+                result = detector.detect(target, target_ip=target_ip)
                 results[protocol] = result
 
             except Exception as e:
@@ -354,7 +406,7 @@ class RelayKingScanner:
             if 'smb' in results and results['smb'].available:
                 try:
                     webdav_detector = WebDAVDetector(self.config)
-                    webdav_result = webdav_detector.detect(target)
+                    webdav_result = webdav_detector.detect(target, target_ip=target_ip)
                     results['webdav'] = webdav_result
                 except Exception as e:
                     if self.config.verbose >= 2:
@@ -363,7 +415,7 @@ class RelayKingScanner:
             # NTLM reflection analysis (requires credentials to read registry)
             try:
                 reflection_detector = NTLMReflectionDetector(self.config)
-                reflection_result = reflection_detector.analyze(results, target)
+                reflection_result = reflection_detector.analyze(results, target, target_ip=target_ip)
                 results['ntlm_reflection'] = reflection_result
             except Exception as e:
                 if self.config.verbose >= 2:
@@ -374,6 +426,7 @@ class RelayKingScanner:
     def _check_coercion(self, targets: List[str]) -> Dict:
         """Check coercion vulnerabilities across all targets"""
 
+        hostname_ip_map = self.target_parser.hostname_ip_map
         coercion_results = {}
         coercion_detector = CoercionDetector(self.config)
 
@@ -381,7 +434,8 @@ class RelayKingScanner:
             future_to_target = {}
 
             for target in targets:
-                future = executor.submit(coercion_detector.detect, target)
+                target_ip = hostname_ip_map.get(target, target)
+                future = executor.submit(coercion_detector.detect, target, target_ip=target_ip)
                 future_to_target[future] = target
 
             completed = 0
@@ -409,8 +463,11 @@ class RelayKingScanner:
 
         return coercion_results
 
-    def _check_ntlmv1(self, targets: List[str], all_results: Dict) -> Dict:
+    def _check_ntlmv1(self, targets: List[str], all_results: Dict, hostname_ip_map: Dict = None) -> Dict:
         """Check NTLMv1 support via GPO and/or registry"""
+
+        if hostname_ip_map is None:
+            hostname_ip_map = {}
 
         ntlmv1_results = {
             'domain_policy': None,
@@ -426,7 +483,8 @@ class RelayKingScanner:
             if dc_host:
                 if self.config.verbose >= 2:
                     print(f"[*] Checking domain GPO for NTLMv1 policy on {dc_host}...")
-                ntlmv1_results['domain_policy'] = detector.check_gpo(dc_host)
+                dc_ip = hostname_ip_map.get(dc_host, dc_host)
+                ntlmv1_results['domain_policy'] = detector.check_gpo(dc_host, target_ip=dc_ip)
             else:
                 if self.config.verbose >= 1:
                     print("[!] Could not find DC to check GPO for NTLMv1 policy")
@@ -438,7 +496,8 @@ class RelayKingScanner:
 
             with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
                 future_to_target = {
-                    executor.submit(detector.check_host_registry, target): target
+                    executor.submit(detector.check_host_registry, target,
+                                    target_ip=hostname_ip_map.get(target, target)): target
                     for target in targets
                 }
 

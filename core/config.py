@@ -118,10 +118,14 @@ class RelayKingConfig:
         Returns:
             True if target is a known DC, False otherwise
         """
+        target_lower = target.lower()
+
+        # Check if target matches --dc-ip (works even without --audit)
+        if self.dc_ip and target_lower == self.dc_ip.lower():
+            return True
+
         if not self._dc_hostnames:
             return False
-
-        target_lower = target.lower()
 
         # Check exact match against DC hostnames from AD
         if target_lower in self._dc_hostnames:

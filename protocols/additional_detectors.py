@@ -10,13 +10,14 @@ from .base_detector import BaseDetector, ProtocolResult
 class SMTPDetector(BaseDetector):
     """Detector for SMTP protocol"""
 
-    def detect(self, host: str, port: int = 25) -> ProtocolResult:
+    def detect(self, host: str, port: int = 25, target_ip: str = None) -> ProtocolResult:
         """Detect SMTP configuration"""
 
+        connect_to = self._resolve_ip(host, target_ip)
         result = self._create_result('smtp', host, port)
 
         try:
-            with socket.create_connection((host, port), timeout=self._get_timeout()) as sock:
+            with socket.create_connection((connect_to, port), timeout=self._get_timeout()) as sock:
                 # Receive banner
                 banner = sock.recv(1024).decode('utf-8', errors='ignore')
                 result.available = True
@@ -54,9 +55,10 @@ class SMTPDetector(BaseDetector):
 class IMAPDetector(BaseDetector):
     """Detector for IMAP protocol"""
 
-    def detect(self, host: str, port: int = 143, use_ssl: bool = False) -> ProtocolResult:
+    def detect(self, host: str, port: int = 143, use_ssl: bool = False, target_ip: str = None) -> ProtocolResult:
         """Detect IMAP configuration"""
 
+        connect_to = self._resolve_ip(host, target_ip)
         protocol = 'imaps' if use_ssl else 'imap'
         result = self._create_result(protocol, host, port if port != 143 else (993 if use_ssl else 143))
 
@@ -65,7 +67,7 @@ class IMAPDetector(BaseDetector):
             if use_ssl and port == 143:
                 port = 993
 
-            sock = socket.create_connection((host, port), timeout=self._get_timeout())
+            sock = socket.create_connection((connect_to, port), timeout=self._get_timeout())
 
             if use_ssl:
                 import ssl
@@ -105,9 +107,10 @@ class IMAPDetector(BaseDetector):
 class WINRMDetector(BaseDetector):
     """Detector for WINRM/WINRMS protocol"""
 
-    def detect(self, host: str, port: int = 5985, use_ssl: bool = False) -> ProtocolResult:
+    def detect(self, host: str, port: int = 5985, use_ssl: bool = False, target_ip: str = None) -> ProtocolResult:
         """Detect WINRM configuration"""
 
+        connect_to = self._resolve_ip(host, target_ip)
         protocol = 'winrms' if use_ssl else 'winrm'
         result = self._create_result(protocol, host, port if port != 5985 else (5986 if use_ssl else 5985))
 
@@ -120,16 +123,17 @@ class WINRMDetector(BaseDetector):
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-            # Build URL
+            # Build URL (use resolved IP for connection)
             scheme = 'https' if use_ssl else 'http'
-            url = f"{scheme}://{host}:{port}/wsman"
+            url = f"{scheme}://{connect_to}:{port}/wsman"
 
             # Try to connect
             response = requests.get(
                 url,
                 timeout=self._get_timeout(),
                 verify=False,
-                allow_redirects=False
+                allow_redirects=False,
+                headers={'Host': host}
             )
 
             # WINRM should respond with 401 and WWW-Authenticate header
@@ -161,14 +165,14 @@ class WINRMDetector(BaseDetector):
 class IMAPSDetector(IMAPDetector):
     """Detector specifically for IMAPS"""
 
-    def detect(self, host: str, port: int = 993) -> ProtocolResult:
+    def detect(self, host: str, port: int = 993, target_ip: str = None) -> ProtocolResult:
         """Detect IMAPS configuration"""
-        return super().detect(host, port, use_ssl=True)
+        return super().detect(host, port, use_ssl=True, target_ip=target_ip)
 
 
 class WINRMSDetector(WINRMDetector):
     """Detector specifically for WINRMS"""
 
-    def detect(self, host: str, port: int = 5986) -> ProtocolResult:
+    def detect(self, host: str, port: int = 5986, target_ip: str = None) -> ProtocolResult:
         """Detect WINRMS configuration"""
-        return super().detect(host, port, use_ssl=True)
+        return super().detect(host, port, use_ssl=True, target_ip=target_ip)

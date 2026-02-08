@@ -15,9 +15,9 @@ class ProtocolResult:
     host: str
     port: int
     available: bool = False
-    signing_required: Optional[bool] = False
-    epa_enforced: Optional[bool] = False
-    channel_binding: Optional[bool] = False
+    signing_required: Optional[bool] = None
+    epa_enforced: Optional[bool] = None
+    channel_binding: Optional[bool] = None
     ntlmv1_supported: bool = False
     anonymous_allowed: bool = False
     version: Optional[str] = None
@@ -124,17 +124,22 @@ class BaseDetector(ABC):
         self.config = config
 
     @abstractmethod
-    def detect(self, host: str) -> ProtocolResult:
+    def detect(self, host: str, target_ip: str = None) -> ProtocolResult:
         """
         Detect protocol configuration on target host
 
         Args:
-            host: Target hostname or IP
+            host: Target hostname (used for Kerberos SPN, SMB name, display)
+            target_ip: Resolved IP address for TCP connections (falls back to host if None)
 
         Returns:
             ProtocolResult with detection findings
         """
         pass
+
+    def _resolve_ip(self, host: str, target_ip: str = None) -> str:
+        """Get the IP to use for TCP connections"""
+        return target_ip if target_ip else host
 
     def _create_result(self, protocol: str, host: str, port: int, **kwargs) -> ProtocolResult:
         """Helper to create a ProtocolResult"""
@@ -148,13 +153,14 @@ class BaseDetector(ABC):
         """Check if verbose output is enabled at given level"""
         return self.config.verbose >= level
 
-    def _is_port_open(self, host: str, port: int) -> bool:
-        """Check if a port is open"""
+    def _is_port_open(self, host: str, port: int, target_ip: str = None) -> bool:
+        """Check if a port is open using resolved IP"""
         import socket
+        connect_to = self._resolve_ip(host, target_ip)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(3)  # Use 3-second timeout for quick port check
-            result = sock.connect_ex((host, port))
+            result = sock.connect_ex((connect_to, port))
             sock.close()
             return result == 0
         except Exception:

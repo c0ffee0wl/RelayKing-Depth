@@ -28,15 +28,20 @@ class NTLMv1Detector:
         self.gpo_ntlmv1_enabled = None
         self.vulnerable_hosts = {}
 
-    def check_gpo(self, dc_host: str) -> dict:
+    def check_gpo(self, dc_host: str, target_ip: str = None) -> dict:
         """
         Check GPO for domain-wide NTLMv1 policy
+
+        Args:
+            dc_host: DC hostname
+            target_ip: Resolved IP for TCP connection (falls back to dc_host)
 
         Returns dict with:
             - enabled: bool (True if NTLMv1 is allowed by GPO)
             - level: int (LmCompatibilityLevel value)
             - details: str (explanation)
         """
+        connect_to = target_ip if target_ip else dc_host
         result = {
             'enabled': False,
             'level': None,
@@ -50,8 +55,8 @@ class NTLMv1Detector:
             # Computer Configuration -> Windows Settings -> Security Settings -> Local Policies -> Security Options
             # "Network security: LAN Manager authentication level"
 
-            ldap_url = f"ldap://{dc_host}"
-            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=dc_host)
+            ldap_url = f"ldap://{connect_to}"
+            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=connect_to)
 
             # Authenticate using Kerberos if specified, otherwise NTLM
             # For GPO check, dc_host IS a DC so use should_use_kerberos
@@ -104,7 +109,7 @@ class NTLMv1Detector:
             if self.config.verbose >= 2:
                 print(f"[*] Checking DC registry for domain NTLMv1 policy...")
 
-            level = self._get_lm_compat_level(dc_host)
+            level = self._get_lm_compat_level(dc_host, target_ip=connect_to)
 
             if level is not None:
                 result['level'] = level
@@ -125,9 +130,13 @@ class NTLMv1Detector:
 
         return result
 
-    def check_host_registry(self, host: str) -> dict:
+    def check_host_registry(self, host: str, target_ip: str = None) -> dict:
         """
         Check a specific host's registry for NTLMv1 support
+
+        Args:
+            host: hostname
+            target_ip: Resolved IP for TCP connection (falls back to host)
 
         Returns dict with:
             - enabled: bool (True if NTLMv1 is supported)
@@ -142,7 +151,7 @@ class NTLMv1Detector:
         }
 
         try:
-            level = self._get_lm_compat_level(host)
+            level = self._get_lm_compat_level(host, target_ip=target_ip)
 
             if level is not None:
                 result['level'] = level
@@ -156,16 +165,17 @@ class NTLMv1Detector:
 
         return result
 
-    def _get_lm_compat_level(self, host: str) -> int:
+    def _get_lm_compat_level(self, host: str, target_ip: str = None) -> int:
         """
         Read LmCompatibilityLevel from remote registry
 
         Registry key: HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\LmCompatibilityLevel
         Default value if not set: 3 (Send NTLMv2 response only)
         """
+        connect_to = target_ip if target_ip else host
         try:
-            # Create RPC transport over SMB
-            rpc = transport.DCERPCTransportFactory(f"ncacn_np:{host}[\\pipe\\winreg]")
+            # Create RPC transport over SMB (use resolved IP for connection)
+            rpc = transport.DCERPCTransportFactory(f"ncacn_np:{connect_to}[\\pipe\\winreg]")
 
             # Set credentials
             use_kerberos = self.config.should_use_kerberos(host)
@@ -183,7 +193,7 @@ class NTLMv1Detector:
                 else:
                     rpc.set_credentials(
                         self.config.username,
-                        self.config.password,
+                        self.config.password or '',
                         self.config.domain or '',
                         self.config.lmhash or '',
                         self.config.nthash or ''
@@ -219,7 +229,7 @@ class NTLMv1Detector:
                     print(f"[*] LmCompatibilityLevel from {host}: {level}")
 
                 return level
-            except:
+            except Exception:
                 # Key doesn't exist - return default value
                 dce.disconnect()
                 if self.config.verbose >= 2:

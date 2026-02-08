@@ -14,13 +14,18 @@ class WebDAVDetector:
     def __init__(self, config):
         self.config = config
 
-    def detect(self, host: str) -> dict:
+    def detect(self, host: str, target_ip: str = None) -> dict:
         """
         Detect WebDAV/WebClient service
+
+        Args:
+            host: hostname (used for SMB name, Kerberos SPN)
+            target_ip: resolved IP for TCP connection (falls back to host)
 
         Returns:
             dict with 'enabled' bool and optional 'error' str
         """
+        connect_to = target_ip if target_ip else host
         result = {
             'enabled': False,
             'error': None
@@ -50,8 +55,8 @@ class WebDAVDetector:
                 aesKey = self.config.aesKey
                 dc_ip = self.config.dc_ip
 
-            # Connect to SMB
-            conn = SMBConnection(host, host, timeout=self.config.timeout)
+            # Connect to SMB (remoteName=hostname, remoteHost=IP)
+            conn = SMBConnection(host, connect_to, timeout=self.config.timeout)
 
             try:
                 # Login - use Kerberos if specified
@@ -64,6 +69,10 @@ class WebDAVDetector:
                         krb_error = str(krb_err).lower()
                         if 'kdc' in krb_error or 'kerberos' in krb_error or 'krb' in krb_error:
                             result['error'] = f'Kerberos auth failed: {krb_err}'
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
                             return result
                         raise
                 elif nthash:
@@ -99,7 +108,10 @@ class WebDAVDetector:
                 except Exception as e:
                     result['error'] = f'IPC$ connection failed: {e}'
 
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
             except Exception as e:
                 error_str = str(e).lower()
@@ -107,6 +119,10 @@ class WebDAVDetector:
                     result['error'] = 'Authentication failed'
                 else:
                     result['error'] = str(e)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         except Exception as e:
             result['error'] = str(e)

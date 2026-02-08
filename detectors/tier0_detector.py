@@ -4,7 +4,6 @@ Detects SCCM, ADCS (Certificate Authorities), and Exchange servers via LDAP quer
 """
 
 from typing import Set
-import logging
 
 
 class Tier0Detector:
@@ -94,10 +93,10 @@ class Tier0Detector:
                             sccm_hosts.add(hostname.lower())
 
             if sccm_hosts:
-                logging.info(f"[+] Found {len(sccm_hosts)} SCCM server(s)")
+                print(f"[+] Found {len(sccm_hosts)} SCCM server(s)")
 
         except Exception as e:
-            logging.debug(f"[-] Error detecting SCCM: {e}")
+            print(f"[-] Error detecting SCCM: {e}")
 
         return sccm_hosts
 
@@ -131,10 +130,10 @@ class Tier0Detector:
                     adcs_hosts.add(hostname.lower())
 
             if adcs_hosts:
-                logging.info(f"[+] Found {len(adcs_hosts)} ADCS server(s)")
+                print(f"[+] Found {len(adcs_hosts)} ADCS server(s)")
 
         except Exception as e:
-            logging.debug(f"[-] Error detecting ADCS: {e}")
+            print(f"[-] Error detecting ADCS: {e}")
 
         return adcs_hosts
 
@@ -180,10 +179,10 @@ class Tier0Detector:
                             continue
 
             if exchange_hosts:
-                logging.info(f"[+] Found {len(exchange_hosts)} Exchange server(s)")
+                print(f"[+] Found {len(exchange_hosts)} Exchange server(s)")
 
         except Exception as e:
-            logging.debug(f"[-] Error detecting Exchange: {e}")
+            print(f"[-] Error detecting Exchange: {e}")
 
         return exchange_hosts
 

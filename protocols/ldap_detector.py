@@ -12,24 +12,25 @@ from .base_detector import BaseDetector, ProtocolResult
 class LDAPDetector(BaseDetector):
     """Detector for LDAP/LDAPS protocols"""
 
-    def detect(self, host: str, port: int = 389, use_ssl: bool = False) -> ProtocolResult:
+    def detect(self, host: str, port: int = 389, use_ssl: bool = False, target_ip: str = None) -> ProtocolResult:
         """Detect LDAP configuration using RelayInformer-style detection"""
 
+        connect_to = self._resolve_ip(host, target_ip)
         protocol = 'ldaps' if use_ssl else 'ldap'
         result = self._create_result(protocol, host, port)
 
         # Check if port is open first
-        if not self._is_port_open(host, port):
+        if not self._is_port_open(host, port, target_ip=target_ip):
             result.error = 'Port closed'
             return result
 
         try:
             # Check signing and channel binding BEFORE attempting auth
             # This works regardless of whether we have credentials or not
-            result.signing_required = self._check_ldap_signing(host)
+            result.signing_required = self._check_ldap_signing(connect_to)
 
             if use_ssl:
-                result.channel_binding = self._check_ldaps_channel_binding(host)
+                result.channel_binding = self._check_ldaps_channel_binding(connect_to)
                 # Note if channel binding couldn't be determined due to null auth
                 if result.channel_binding is None and self.config.null_auth:
                     result.additional_info['channel_binding_note'] = 'Cannot test channel binding without credentials (--null-auth mode)'
@@ -41,9 +42,9 @@ class LDAPDetector(BaseDetector):
             if use_ssl:
                 tls = Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2)
 
-            # Create server
+            # Create server (use resolved IP for connection)
             server = Server(
-                host,
+                connect_to,
                 port=port,
                 use_ssl=use_ssl,
                 tls=tls,
@@ -63,8 +64,8 @@ class LDAPDetector(BaseDetector):
                         # Use impacket for Kerberos LDAP authentication
                         from impacket.ldap import ldap as ldap_impacket
 
-                        ldap_url = f"{'ldaps' if use_ssl else 'ldap'}://{host}"
-                        ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=host)
+                        ldap_url = f"{'ldaps' if use_ssl else 'ldap'}://{connect_to}"
+                        ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=connect_to)
 
                         # Kerberos login - use uppercase domain for realm matching, useCache for ccache
                         krb_domain = self.config.domain.upper() if self.config.domain else ''
@@ -101,7 +102,7 @@ class LDAPDetector(BaseDetector):
                         conn = Connection(
                             server,
                             user=user,
-                            password=self.config.password,
+                            password=self.config.password or '',
                             authentication=NTLM
                         )
 
@@ -154,7 +155,8 @@ class LDAPDetector(BaseDetector):
             # Try to bind to regular LDAP (non-SSL) without signing
             ldap_url = f"ldap://{host}"
             # Create connection - by default impacket doesn't enforce signing
-            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=host, signing=False)
+            # Note: avoid passing signing= kwarg as it's not supported in all impacket versions
+            ldap_conn = ldap_impacket.LDAPConnection(url=ldap_url, baseDN=self.config.domain, dstIp=host)
 
             # Attempt login with just domain (no credentials)
             # We just want to see if strongerAuthRequired error occurs
@@ -235,11 +237,11 @@ class LDAPDetector(BaseDetector):
                 result_str = str(ldap_conn.result)
 
                 # Check for channel binding error (SEC_E_BAD_BINDINGS)
-                if "data 80090346" in result_str or "80090346" in result_str:
+                if "data 80090346" in result_str:
                     return True
 
-                # Check for invalid credentials
-                elif "data 52e" in result_str or "52e" in result_str:
+                # Check for invalid credentials (AD error code 52e)
+                elif "data 52e" in result_str:
                     return False
 
                 # Other error - likely NTLM disabled
@@ -258,6 +260,6 @@ class LDAPDetector(BaseDetector):
 class LDAPSDetector(LDAPDetector):
     """Detector specifically for LDAPS"""
 
-    def detect(self, host: str, port: int = 636) -> ProtocolResult:
+    def detect(self, host: str, port: int = 636, target_ip: str = None) -> ProtocolResult:
         """Detect LDAPS configuration"""
-        return super().detect(host, port, use_ssl=True)
+        return super().detect(host, port, use_ssl=True, target_ip=target_ip)

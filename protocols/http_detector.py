@@ -62,7 +62,7 @@ class HTTPDetector(BaseDetector):
         '/sms_mp/.sms_aut',
     ]
 
-    def detect(self, host: str, port: int = 80, use_ssl: bool = False) -> ProtocolResult:
+    def detect(self, host: str, port: int = 80, use_ssl: bool = False, target_ip: str = None) -> ProtocolResult:
         """
         Detect HTTP/HTTPS configuration
 
@@ -73,6 +73,7 @@ class HTTPDetector(BaseDetector):
         For HTTPS with credentials: Tests actual EPA enforcement via NTLM auth
         For HTTP: Always marks as relayable (no channel binding possible)
         """
+        self._current_target_ip = self._resolve_ip(host, target_ip)
         protocol = 'https' if use_ssl else 'http'
         result = self._create_result(protocol, host, port)
 
@@ -182,7 +183,8 @@ class HTTPDetector(BaseDetector):
             'AUTH_FAILED' - Authentication failed (bad creds)
             'ERROR' - Could not determine
         """
-        url = f"https://{host}:{port}{path}"
+        connect_to = getattr(self, '_current_target_ip', host)
+        url = f"https://{connect_to}:{port}{path}"
 
         username = f"{self.config.domain}\\{self.config.username}" if self.config.domain else self.config.username
         password = self.config.password
@@ -194,20 +196,23 @@ class HTTPDetector(BaseDetector):
             password = f"{lmhash}:{self.config.nthash}"
 
         try:
+            # Use hostname in Host header so IIS routes to the correct virtual host
+            host_header = {'Host': host}
+
             session = requests.Session()
 
             # Test 1: Try with real/correct CBT (send_cbt=True, no custom hash)
             auth_handler = CustomAvHttpNtlmAuth(username, password, send_cbt=True, custom_cert_hash=None)
             session.auth = auth_handler
 
-            response = session.get(url, verify=False, timeout=self._get_timeout())
+            response = session.get(url, verify=False, timeout=self._get_timeout(), headers=host_header)
 
             if response.status_code == 401:
                 # Auth failed even with correct CBT - bad credentials
                 return 'AUTH_FAILED'
             elif response.status_code != 200:
-                # Unexpected response, but not a failure
-                pass
+                # Unexpected response (403, 500, 302, etc.) - tests are inconclusive
+                return 'UNKNOWN'
 
             # Test 2: Try with bogus CBT
             session2 = requests.Session()
@@ -215,7 +220,7 @@ class HTTPDetector(BaseDetector):
             auth_handler2 = CustomAvHttpNtlmAuth(username, password, send_cbt=True, custom_cert_hash=bogus_cbt)
             session2.auth = auth_handler2
 
-            response2 = session2.get(url, verify=False, timeout=self._get_timeout())
+            response2 = session2.get(url, verify=False, timeout=self._get_timeout(), headers=host_header)
 
             if response2.status_code == 401:
                 # Bogus CBT was rejected - EPA is enforced
@@ -226,7 +231,7 @@ class HTTPDetector(BaseDetector):
             auth_handler3 = CustomAvHttpNtlmAuth(username, password, send_cbt=False, custom_cert_hash=None)
             session3.auth = auth_handler3
 
-            response3 = session3.get(url, verify=False, timeout=self._get_timeout())
+            response3 = session3.get(url, verify=False, timeout=self._get_timeout(), headers=host_header)
 
             if response3.status_code == 200:
                 # Success without CBT - EPA is set to "never" or "when supported"
@@ -237,7 +242,7 @@ class HTTPDetector(BaseDetector):
                 return 'WHEN_SUPPORTED'
 
             # Couldn't determine clearly
-            return 'NOT_ENFORCED'  # Default to not enforced if we couldn't confirm
+            return 'UNKNOWN'
 
         except requests.exceptions.SSLError as e:
             return f'TLS_ERROR: {str(e)}'
@@ -253,6 +258,7 @@ class HTTPDetector(BaseDetector):
         Quick connectivity check to see if a web server is listening
         Returns True if server responds, False otherwise
         """
+        connect_to = getattr(self, '_current_target_ip', host)
         try:
             # Use socket for quick connectivity test (faster than HTTP request)
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -265,7 +271,7 @@ class HTTPDetector(BaseDetector):
                 context.verify_mode = ssl.CERT_NONE
                 sock = context.wrap_socket(sock, server_hostname=host)
 
-            sock.connect((host, port))
+            sock.connect((connect_to, port))
             sock.close()
             return True
 
@@ -337,14 +343,16 @@ class HTTPDetector(BaseDetector):
 
     def _check_path_for_ntlm(self, host: str, port: int, scheme: str, path: str) -> bool:
         """Check if a specific path requires NTLM authentication"""
+        connect_to = getattr(self, '_current_target_ip', host)
         try:
-            url = f"{scheme}://{host}:{port}{path}"
+            url = f"{scheme}://{connect_to}:{port}{path}"
 
             response = requests.get(
                 url,
                 timeout=self._get_timeout(),
                 verify=False,
-                allow_redirects=False
+                allow_redirects=False,
+                headers={'Host': host}  # Use hostname in Host header
             )
 
             # Check for NTLM/Negotiate authentication in WWW-Authenticate header
@@ -365,22 +373,23 @@ class HTTPDetector(BaseDetector):
 
     def _get_tls_version(self, host: str, port: int) -> str:
         """Get TLS version"""
+        connect_to = getattr(self, '_current_target_ip', host)
         try:
             context = ssl.create_default_context()
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
 
-            with socket.create_connection((host, port), timeout=self._get_timeout()) as sock:
+            with socket.create_connection((connect_to, port), timeout=self._get_timeout()) as sock:
                 with context.wrap_socket(sock, server_hostname=host) as ssock:
                     return ssock.version()
 
-        except:
+        except Exception:
             return None
 
 
 class HTTPSDetector(HTTPDetector):
     """Detector specifically for HTTPS"""
 
-    def detect(self, host: str, port: int = 443) -> ProtocolResult:
+    def detect(self, host: str, port: int = 443, target_ip: str = None) -> ProtocolResult:
         """Detect HTTPS configuration"""
-        return super().detect(host, port, use_ssl=True)
+        return super().detect(host, port, use_ssl=True, target_ip=target_ip)

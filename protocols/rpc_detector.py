@@ -12,7 +12,7 @@ from .base_detector import BaseDetector, ProtocolResult
 class RPCDetector(BaseDetector):
     """Detector for MS-RPC protocol"""
 
-    def detect(self, host: str, port: int = 135) -> ProtocolResult:
+    def detect(self, host: str, port: int = 135, target_ip: str = None) -> ProtocolResult:
         """
         Detect RPC configuration by testing authentication levels
 
@@ -20,11 +20,12 @@ class RPCDetector(BaseDetector):
         The lowest level that succeeds determines if signing is required
         """
 
+        connect_to = self._resolve_ip(host, target_ip)
         result = self._create_result('rpc', host, port)
 
         try:
-            # Build RPC connection string
-            string_binding = f'ncacn_ip_tcp:{host}[{port}]'
+            # Build RPC connection string (use resolved IP for TCP)
+            string_binding = f'ncacn_ip_tcp:{connect_to}[{port}]'
 
             if self.config.null_auth:
                 username = ''
@@ -153,10 +154,11 @@ class RPCDetector(BaseDetector):
 
         return result
 
-    def _query_endpoints(self, host: str) -> list:
+    def _query_endpoints(self, host: str, target_ip: str = None) -> list:
         """Query RPC endpoint mapper for available endpoints"""
+        connect_to = self._resolve_ip(host, target_ip)
         try:
-            string_binding = f'ncacn_ip_tcp:{host}[135]'
+            string_binding = f'ncacn_ip_tcp:{connect_to}[135]'
             rpc_transport = transport.DCERPCTransportFactory(string_binding)
             rpc_transport.set_connect_timeout(self._get_timeout())
 
@@ -179,7 +181,7 @@ class RPCDetector(BaseDetector):
                         'uuid': uuid,
                         'binding': binding
                     })
-                except:
+                except Exception:
                     pass
 
             dce.disconnect()

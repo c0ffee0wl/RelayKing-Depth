@@ -12,9 +12,10 @@ import socket
 class SMBDetector(BaseDetector):
     """Detector for SMB/SMB2/SMB3 protocols"""
 
-    def detect(self, host: str, port: int = 445) -> ProtocolResult:
+    def detect(self, host: str, port: int = 445, target_ip: str = None) -> ProtocolResult:
         """Detect SMB configuration"""
 
+        connect_to = self._resolve_ip(host, target_ip)
         result = self._create_result('smb', host, port)
 
         try:
@@ -38,8 +39,8 @@ class SMBDetector(BaseDetector):
                 aesKey = self.config.aesKey
                 dc_ip = self.config.dc_ip
 
-            # Try to connect
-            conn = SMBConnection(host, host, sess_port=port, timeout=self._get_timeout())
+            # Try to connect (remoteName=hostname for SMB negotiation, remoteHost=IP for TCP)
+            conn = SMBConnection(host, connect_to, sess_port=port, timeout=self._get_timeout())
 
             try:
                 # Login - use Kerberos if specified
@@ -67,12 +68,12 @@ class SMBDetector(BaseDetector):
                                     result.signing_required = conn.isSigningRequired()
                                 else:
                                     result.signing_required = conn._SMBConnection._Connection.get("RequireSigning", False)
-                            except:
+                            except Exception:
                                 pass
 
                             try:
                                 conn.close()
-                            except:
+                            except Exception:
                                 pass
                             return result
                         else:
@@ -167,7 +168,12 @@ class SMBDetector(BaseDetector):
                         else:
                             # SMB2+: Access RequireSigning from protocol negotiation
                             result.signing_required = conn._SMBConnection._Connection.get("RequireSigning", False)
-                    except:
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.close()
+                    except Exception:
                         pass
 
                 elif 'STATUS_ACCESS_DENIED' in str(e):
@@ -183,10 +189,19 @@ class SMBDetector(BaseDetector):
                             result.signing_required = conn.isSigningRequired()
                         else:
                             result.signing_required = conn._SMBConnection._Connection.get("RequireSigning", False)
-                    except:
+                    except Exception:
+                        pass
+
+                    try:
+                        conn.close()
+                    except Exception:
                         pass
                 else:
                     result.error = str(e)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
         except socket.timeout:
             result.error = 'Connection timeout'
@@ -197,27 +212,29 @@ class SMBDetector(BaseDetector):
 
         return result
 
-    def _check_ntlmv1(self, host: str, port: int) -> bool:
+    def _check_ntlmv1(self, host: str, port: int, target_ip: str = None) -> bool:
         """
         Check if NTLMv1 is supported
         This requires attempting an NTLMv1 authentication
         """
+        connect_to = self._resolve_ip(host, target_ip)
         try:
             # Create a new connection specifically for NTLMv1 test
-            conn = SMBConnection(host, host, sess_port=port, timeout=self._get_timeout())
+            conn = SMBConnection(host, connect_to, sess_port=port, timeout=self._get_timeout())
 
             # Attempt to force NTLMv1
             # This is a simplified check - full implementation would modify
             # the NTLM negotiation to request NTLMv1
             # For now, we assume NTLMv1 is supported if SMB1 is available
 
-            dialect = conn.getDialect()
-            if dialect == SMB_DIALECT:
-                # SMB1 typically supports NTLMv1
-                return True
+            try:
+                dialect = conn.getDialect()
+                if dialect == SMB_DIALECT:
+                    # SMB1 typically supports NTLMv1
+                    return True
+                return False
+            finally:
+                conn.close()
 
-            conn.close()
-            return False
-
-        except:
+        except Exception:
             return False

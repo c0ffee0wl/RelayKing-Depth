@@ -48,7 +48,7 @@ class NTLMReflectionDetector:
                     thread_name_prefix="ntlm_reflection_registry"
                 )
 
-    def analyze(self, protocol_results: dict, target: str) -> dict:
+    def analyze(self, protocol_results: dict, target: str, target_ip: str = None) -> dict:
         """
         Analyze protocol results to identify CVE-2025-33073 vulnerability
 
@@ -58,10 +58,12 @@ class NTLMReflectionDetector:
         Args:
             protocol_results: dict of protocol -> ProtocolResult
             target: hostname/IP of the target
+            target_ip: resolved IP for TCP connections (falls back to target)
 
         Returns:
             dict with 'vulnerable' bool, 'paths' list, and optional 'details'
         """
+        self._current_target_ip = target_ip if target_ip else target
         result = {
             'vulnerable': False,
             'paths': [],
@@ -98,7 +100,7 @@ class NTLMReflectionDetector:
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                future = self._registry_pool.submit(self._get_ubr_from_registry, target)
+                future = self._registry_pool.submit(self._get_ubr_from_registry, target, self._current_target_ip)
                 # Wait up to 10 seconds for registry read
                 ubr = future.result(timeout=10.0)
 
@@ -150,12 +152,13 @@ class NTLMReflectionDetector:
         # 1. This is a Domain Controller
         # 2. OS is Server 2025 (build 26100)
         # 3. UBR < 6584 (unpatched for CVE-2025-54918)
-        if self.config.is_dc(target) and major == 10 and minor == 0 and build == 26100 and ubr < 6584:
+        is_dc = self.config.is_dc(target) or (self._current_target_ip and self.config.is_dc(self._current_target_ip))
+        if is_dc and major == 10 and (minor or 0) == 0 and build == 26100 and ubr < 6584:
             if self.config.verbose >= 2:
                 print(f"[*] Detected Server 2025 DC (build {build}.{ubr}) - checking PrintSpooler for CVE-2025-54918")
 
             # Check if PrintSpooler is enabled
-            printspooler_enabled = self._check_printspooler_enabled(target)
+            printspooler_enabled = self._check_printspooler_enabled(target, self._current_target_ip)
 
             if printspooler_enabled:
                 # Store CVE-2025-54918 vulnerability in result for relay_analyzer to use
@@ -224,13 +227,14 @@ class NTLMReflectionDetector:
 
         return result
 
-    def _get_ubr_from_registry(self, target: str) -> int:
+    def _get_ubr_from_registry(self, target: str, target_ip: str = None) -> int:
         """
         Get UBR (Update Build Revision) from remote registry
         Returns UBR as int or None
 
         Uses semaphore to limit concurrent DCE/RPC connections
         """
+        connect_to = target_ip if target_ip else target
 
         # Acquire semaphore with timeout (wait max 5 seconds for slot)
         acquired = self._dce_semaphore.acquire(timeout=5.0)
@@ -241,8 +245,8 @@ class NTLMReflectionDetector:
 
         try:
             try:
-                # Create RPC transport over SMB named pipe
-                rpc = transport.DCERPCTransportFactory(f"ncacn_np:{target}[\\pipe\\winreg]")
+                # Create RPC transport over SMB named pipe (use resolved IP)
+                rpc = transport.DCERPCTransportFactory(f"ncacn_np:{connect_to}[\\pipe\\winreg]")
 
                 # Set credentials
                 use_kerberos = self.config.should_use_kerberos(target)
@@ -260,7 +264,7 @@ class NTLMReflectionDetector:
                     else:
                         rpc.set_credentials(
                             self.config.username,
-                            self.config.password,
+                            self.config.password or '',
                             self.config.domain or '',
                             self.config.lmhash or '',
                             self.config.nthash or ''
@@ -327,13 +331,14 @@ class NTLMReflectionDetector:
             # Always release semaphore
             self._dce_semaphore.release()
 
-    def _check_printspooler_enabled(self, target: str) -> bool:
+    def _check_printspooler_enabled(self, target: str, target_ip: str = None) -> bool:
         """
         Check if PrintSpooler service is enabled via RPC over TCP
         Returns True if PrintSpooler is enabled, False otherwise
 
         Uses RPC over TCP (ncacn_ip_tcp) as required for Server 2025
         """
+        connect_to = target_ip if target_ip else target
 
         # Acquire semaphore with timeout (wait max 5 seconds for slot)
         acquired = self._dce_semaphore.acquire(timeout=5.0)
@@ -344,9 +349,8 @@ class NTLMReflectionDetector:
 
         try:
             try:
-                # Build RPC over TCP connection string
-                # First try to use port 135 for endpoint mapper
-                stringbinding = f'ncacn_ip_tcp:{target}'
+                # Build RPC over TCP connection string (use resolved IP)
+                stringbinding = f'ncacn_ip_tcp:{connect_to}'
 
                 if self.config.verbose >= 3:
                     print(f"[*] Checking PrintSpooler on {target} via RPC over TCP")
@@ -370,7 +374,7 @@ class NTLMReflectionDetector:
                     else:
                         rpctransport.set_credentials(
                             self.config.username,
-                            self.config.password,
+                            self.config.password or '',
                             self.config.domain or '',
                             self.config.lmhash or '',
                             self.config.nthash or ''

@@ -221,17 +221,18 @@ class PlaintextFormatter:
             output.append("=" * 80)
 
             for host, vulns in coercion_results.items():
-                vulnerable_count = sum(1 for v in vulns.values() if v.get('accessible'))
+                vulnerable_count = sum(1 for v in vulns.values() if v.get('vulnerable'))
 
                 if vulnerable_count > 0:
                     output.append(f"\nHost: {host}")
                     output.append("-" * 80)
 
                     for vuln_name, status in vulns.items():
-                        if status.get('accessible'):
-                            output.append(f"  [+] {vuln_name}: VULNERABLE")
-                        elif status.get('error') and 'Access denied (pipe exists)' in status.get('error', ''):
-                            output.append(f"  [~] {vuln_name}: Pipe exists (access denied)")
+                        if status.get('vulnerable'):
+                            methods_str = ', '.join(status.get('methods', [])) if status.get('methods') else 'unknown method'
+                            output.append(f"  [+] {vuln_name}: VULNERABLE ({methods_str})")
+                        elif status.get('error'):
+                            output.append(f"  [-] {vuln_name}: {status['error']}")
 
         return '\n'.join(output)
 

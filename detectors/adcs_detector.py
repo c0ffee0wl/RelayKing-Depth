@@ -64,7 +64,7 @@ class ADCSDetector:
 
             return False
 
-        except:
+        except Exception:
             return False
 
     @staticmethod
@@ -87,7 +87,7 @@ class ADCSDetector:
             if not dc_ip:
                 try:
                     dc_ip = socket.gethostbyname(config.domain)
-                except:
+                except Exception:
                     return adcs_servers
 
             # Connect to LDAP
