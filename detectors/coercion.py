@@ -5,7 +5,7 @@ Based on NetExec coerce_plus module
 """
 
 from impacket.dcerpc.v5 import transport, rprn, epm
-from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTER, NDRPOINTERNULL
+from impacket.dcerpc.v5.ndr import NDRCALL, NDRSTRUCT, NDRPOINTERNULL
 from impacket.dcerpc.v5.dtypes import LPWSTR, DWORD, ULONG, NULL, WSTR, LONG, BOOL, PCHAR, RPC_SID
 from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_GSS_NEGOTIATE, RPC_C_AUTHN_LEVEL_PKT_PRIVACY
 from impacket.uuid import uuidtup_to_bin

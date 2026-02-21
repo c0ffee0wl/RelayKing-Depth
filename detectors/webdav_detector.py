@@ -5,7 +5,6 @@ Based on NetExec webdav module logic
 """
 
 from impacket.smbconnection import SMBConnection
-from impacket.dcerpc.v5 import transport
 
 
 class WebDAVDetector:

@@ -8,7 +8,6 @@ import requests
 import os
 import socket
 import ssl
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .base_detector import BaseDetector, ProtocolResult
 

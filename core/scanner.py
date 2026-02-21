@@ -6,18 +6,8 @@ Main scanning orchestration and coordination
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
 import sys
-import socket
 
-try:
-    import dns.resolver
-    import dns.query
-    import dns.message
-    import dns.rdatatype
-    DNS_AVAILABLE = True
-except ImportError:
-    DNS_AVAILABLE = False
-
-from .target_parser import TargetParser, _is_valid_unicast_ip
+from .target_parser import TargetParser
 from .relay_analyzer import RelayAnalyzer
 from .port_scanner import FastPortScanner
 from protocols.smb_detector import SMBDetector
@@ -276,6 +266,7 @@ class RelayKingScanner:
 
         # Run coercion on all targets (use resolved IPs)
         hostname_ip_map = self.target_parser.hostname_ip_map
+        coercion_results = {}
         completed = 0
         with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
             future_to_target = {}
@@ -291,6 +282,7 @@ class RelayKingScanner:
 
                 try:
                     result = future.result()
+                    coercion_results[target] = result
 
                     # Show progress
                     if self.config.verbose >= 1:
@@ -307,7 +299,8 @@ class RelayKingScanner:
                 print()  # Newline after progress
 
         # Final summary
-        print(f"\n[+] Coercion complete. All {len(targets)} targets should have initiated computer account connections to {self.config.coerce_target}")
+        successful = sum(1 for r in coercion_results.values() if any(v.get('vulnerable') for v in r.values()))
+        print(f"\n[+] Coercion complete. {successful}/{len(targets)} targets responded to coercion attempts (listener: {self.config.coerce_target})")
 
         return {
             'targets': targets,
@@ -323,7 +316,7 @@ class RelayKingScanner:
                     'medium_paths': 0,
                     'low_paths': 0,
                 },
-                'coercion': {},
+                'coercion': coercion_results,
             },
             'coercion_count': len(targets),
             'listener': self.config.coerce_target,
@@ -527,74 +520,6 @@ class RelayKingScanner:
             return self.config.dc_ip
 
         return None
-
-    def _resolve_target_ip(self, target: str) -> List[str]:
-        """
-        Resolve target hostname to IP address(es)
-
-        Uses custom DNS server (-ns) and TCP (--dns-tcp) if specified,
-        otherwise falls back to system DNS.
-
-        Returns:
-            List of IP addresses (empty list if resolution fails)
-        """
-        # First check if target is already an IP
-        try:
-            socket.inet_aton(target)
-            return [target]  # Target is already an IP
-        except socket.error:
-            pass  # Not an IP, continue to resolve
-
-        # Use custom DNS if available and specified
-        if DNS_AVAILABLE and self.config.nameserver:
-            try:
-                nameserver = self.config.nameserver
-
-                # Resolve nameserver hostname to IP if needed
-                try:
-                    socket.inet_aton(nameserver)
-                except socket.error:
-                    # Nameserver is a hostname, resolve it first
-                    ns_info = socket.getaddrinfo(nameserver, None, socket.AF_INET)
-                    if ns_info:
-                        nameserver = ns_info[0][4][0]
-
-                # Create DNS query
-                query = dns.message.make_query(target, dns.rdatatype.A)
-
-                # Send query via TCP or UDP based on config
-                if self.config.dns_tcp:
-                    response = dns.query.tcp(query, nameserver, timeout=self.config.timeout)
-                else:
-                    response = dns.query.udp(query, nameserver, timeout=self.config.timeout)
-
-                # Extract IPs from response (filter out invalid addresses)
-                ips = []
-                for rrset in response.answer:
-                    for rdata in rrset:
-                        if hasattr(rdata, 'address'):
-                            ip = rdata.address
-                            if _is_valid_unicast_ip(ip):
-                                ips.append(ip)
-
-                if ips:
-                    return list(set(ips))
-
-            except Exception as e:
-                if self.config.verbose >= 3:
-                    print(f"[!] Custom DNS resolution failed for {target}: {e}")
-                # Fall through to system DNS
-
-        # Fallback to system DNS
-        try:
-            addr_info = socket.getaddrinfo(target, None, socket.AF_INET)
-            # Filter out invalid IPs (multicast, loopback, etc.)
-            ips = [addr[4][0] for addr in addr_info if _is_valid_unicast_ip(addr[4][0])]
-            return list(set(ips))
-        except (socket.gaierror, socket.timeout):
-            return []
-        except Exception:
-            return []
 
     def _get_config_summary(self) -> Dict:
         """Get summary of scan configuration"""

@@ -5,7 +5,6 @@ Based on RelayInformer EPA detection logic
 """
 
 from impacket.tds import MSSQL
-from impacket import ntlm
 import socket
 from .base_detector import BaseDetector, ProtocolResult
 

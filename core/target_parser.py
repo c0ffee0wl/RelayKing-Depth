@@ -4,7 +4,6 @@ Parse targets from various formats: CIDR, ranges, files, AD enumeration
 """
 
 import ipaddress
-import re
 import subprocess
 import platform
 from typing import List, Set
@@ -96,8 +95,16 @@ class TargetParser:
             self._parse_cidr(target)
 
         # Check for IP range (e.g., 192.168.1.1-254)
+        # Validate that the part before the last dash is a valid IP address
+        # to avoid misidentifying hostnames with dashes (e.g., server-name.domain.local)
         elif '-' in target and '.' in target:
-            self._parse_range(target)
+            parts = target.rsplit('-', 1)
+            try:
+                ipaddress.ip_address(parts[0].strip())
+                self._parse_range(target)
+            except ValueError:
+                # Not a valid IP range - treat as hostname
+                self.targets.add(target)
 
         # Single host (IP or hostname)
         else:
@@ -148,6 +155,11 @@ class TargetParser:
 
             start_octet = int(octets[3])
             base = '.'.join(octets[:3])
+
+            # Validate range direction
+            if end_octet < start_octet:
+                print(f"[!] Invalid IP range '{range_spec}': end octet ({end_octet}) is less than start octet ({start_octet})")
+                return
 
             # Generate range
             for i in range(start_octet, end_octet + 1):

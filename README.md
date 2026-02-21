@@ -101,9 +101,9 @@ See the associated blog released on the Depth Security website for more details:
 # Use a venv. Save yourself the hassle.
 
 # Clone repo:
-git clone https://github.com/depthsecurity/RelayKing.git
+git clone https://github.com/c0ffee0wl/RelayKing-Depth.git
 #Navigate to cloned dir:
-cd RelayKing/
+cd RelayKing-Depth/
 # Configure Python venv:
 virtualenv --python=python3 .
 source bin/activate

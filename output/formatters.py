@@ -130,8 +130,8 @@ class PlaintextFormatter:
 
             # Protocol results
             for protocol, result in protocol_results.items():
-                if protocol in ['webdav', 'ntlm_reflection']:
-                    continue  # Handle separately
+                if protocol in ['webdav', 'ntlm_reflection', '_target_ips']:
+                    continue  # Handle separately or skip metadata
 
                 if not hasattr(result, 'available'):
                     continue
@@ -504,7 +504,7 @@ class MarkdownFormatter:
 
         for host, protocol_results in results.get('results', {}).items():
             for protocol, result in protocol_results.items():
-                if protocol in ['webdav', 'ntlm_reflection']:
+                if protocol in ['webdav', 'ntlm_reflection', '_target_ips']:
                     continue
 
                 if not hasattr(result, 'available'):

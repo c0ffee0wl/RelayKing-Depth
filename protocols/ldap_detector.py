@@ -4,7 +4,7 @@ Detects LDAP signing and channel binding requirements
 """
 
 from typing import Optional
-from ldap3 import Server, Connection, NTLM, SIMPLE, ANONYMOUS, ALL, Tls
+from ldap3 import Server, Connection, NTLM, ANONYMOUS, ALL, Tls
 import ssl
 from .base_detector import BaseDetector, ProtocolResult
 

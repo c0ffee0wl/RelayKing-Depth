@@ -4,7 +4,7 @@ Detects SMB signing, channel binding, NTLMv1 support
 """
 
 from impacket.smbconnection import SMBConnection, SMB_DIALECT
-from impacket import smb, smb3
+from impacket import smb3
 from .base_detector import BaseDetector, ProtocolResult
 import socket
 
